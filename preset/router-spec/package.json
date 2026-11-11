@@ -1,0 +1,51 @@
+{
+  "name": "@dsh-external/dsh-router-spec",
+  "version": "0.3.0",
+  "description": "Router Spec (experimental) —— 深度思考优先的任务感知路由预设（DSH ≥0.2 的 agent preset bundle）",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./router-bootstrap": "./router-bootstrap-v10.mjs",
+    "./router-core": "./router-core-v10.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "router-bootstrap-v10.mjs",
+    "router-core-v10.mjs",
+    "cordis.patch.yml",
+    "preset.yml",
+    "agent.cordis.yml"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-preset",
+    "router",
+    "progressive-disclosure"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wms-why/dsh-routing-suite.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.0-rc <1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-agent-preset": ">=0.2.0-rc <1",
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc <1",
+    "@deepseek-ai/dsh-system-prompt": ">=0.2.0-rc <1",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc <1"
+  }
+}

@@ -29,7 +29,7 @@
 
 import {
   applyPersona, bandFor, bandOf, coreFor, parseMode, personaFor, sessionMode, testinessFor, clamp01,
-  classifyTask, extractText, isComplexTask, sessionEvents
+  classifyTask, extractText, isComplexTask, sessionEvents, narrowToolSurface
 } from './router-core-v10.mjs'
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -51,6 +51,9 @@ function toJsonSchema(spec) {
   }
   return { type: 'object', properties, required, additionalProperties: false }
 }
+
+/** 首轮工具面收窄的释放句柄（per-session）——restrict 取交集，必须先释放旧的。 */
+const specSurfaceLift = new Map()
 
 export function apply(ctx, config) {
   const overrides = new Map() // session id -> explicit mode (number 0..1)
@@ -132,9 +135,12 @@ export function apply(ctx, config) {
     let persona
     if (routerMode === 'standard') {
       persona = RL_PERSONA
+      // DSH ≥0.2：AssembledSection 不再带 order，框架在 waterfall 之前排序、
+      // 之后不重排 —— 人设段要排在最前只能插到数组头部。
+      const routerPersonaSection = { name: 'router-persona', text: persona }
       sections = planSection
-        ? [planSection, { name: 'router-persona', text: persona, order: 0 }]
-        : [{ name: 'router-persona', text: persona, order: 0 }]
+        ? [routerPersonaSection, planSection]
+        : [routerPersonaSection]
       core = new Set(['str_replace_editor']) // RL shape: shell + editor
     } else {
       persona = personaFor(mode, modelId)
@@ -151,21 +157,35 @@ export function apply(ctx, config) {
       return { ...assembled, sections, contexts: [] }
     }
 
-    const available = new Set(assembled.tools.map((tool) => tool.name))
-    const shell = available.has('pwsh') ? 'pwsh' : available.has('bash') ? 'bash' : null
+    // DSH ≥0.2：assemble 的返回体是 PromptPresentation（没有 tools），框架在
+    // waterfall 之后才把工具声明挂上去 —— 返回值里写 tools 也会被覆盖。
+    // 工具面改由注册表的准入面表达：对 agent 的全局工具整体 deny，只留 core。
+    const available = new Set((assembled.tools ?? []).map((tool) => tool.name))
+    const toolsSvc = agent?.ctx?.get?.('tools')
+    let known = null
+    try { if (toolsSvc && typeof toolsSvc.view === 'function') known = new Set(toolsSvc.view(agent).restrictableNames) } catch { /* ignore */ }
+    const catalog = known ?? available
+    const shell = catalog.has('pwsh') ? 'pwsh' : catalog.has('bash') ? 'bash' : null
     if (shell === null) {
       throw new Error(`${name}: no platform shell in catalog`)
     }
     core.add(shell)
     // 视觉模型（v4-flash-vision-exp 等）：首轮面齐平标准模式——read_image 直接可用
     // （官方已声明 image 输入；首轮即读图，无需等 promoted 全量目录）。
-    if (/vision/i.test(String(modelId || '')) && available.has('read_image')) core.add('read_image')
+    if (/vision/i.test(String(modelId || '')) && catalog.has('read_image')) core.add('read_image')
+
+    // 首轮工具面收窄（0.2 等价物）：全局工具里只留 core，其余 deny。
+    try {
+      const prev = specSurfaceLift.get(session.id)
+      if (prev) { try { prev() } catch { /* ignore */ } ; specSurfaceLift.delete(session.id) }
+      const disposer = narrowToolSurface(toolsSvc, agent, [...core])
+      if (disposer) specSurfaceLift.set(session.id, disposer)
+    } catch { /* 门失败 → 退化为全量工具面 */ }
 
     return {
       ...assembled,
       sections,
       contexts: [],
-      tools: assembled.tools.filter((tool) => core.has(tool.name)),
     }
   })
 

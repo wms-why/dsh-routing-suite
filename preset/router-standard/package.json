@@ -1,0 +1,53 @@
+{
+  "name": "@dsh-external/dsh-router-standard",
+  "version": "0.3.0",
+  "description": "Router Standard —— 阶段化工具解锁 + native 直调的思维模式路由预设（DSH ≥0.2 的 agent preset bundle）",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./router-bootstrap": "./router-bootstrap-v34.mjs",
+    "./router-core": "./router-core-v34.mjs",
+    "./gitbash-executor": "./gitbash-executor.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "router-bootstrap-v34.mjs",
+    "router-core-v34.mjs",
+    "gitbash-executor.mjs",
+    "cordis.patch.yml",
+    "preset.yml",
+    "agent.cordis.yml"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-preset",
+    "router",
+    "progressive-disclosure"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wms-why/dsh-routing-suite.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.0-rc <1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-agent-preset": ">=0.2.0-rc <1",
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc <1",
+    "@deepseek-ai/dsh-system-prompt": ">=0.2.0-rc <1",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc <1"
+  }
+}

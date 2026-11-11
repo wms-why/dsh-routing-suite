@@ -25,9 +25,11 @@ speced plan → check-in → group close-out → final check, with redteam gate 
 
 ## Install chain (three steps)
 
+**DSH Target**: `>=0.2.0-rc <1` (this repository tracks DSH 0.2.2-rc.1)
+
 ```powershell
 # 1. Clone the suite (single repo: injector/preset content is stored directly, no submodules)
-git clone https://github.com/yjh051108/dsh-routing-suite.git
+git clone https://github.com/wms-why/dsh-routing-suite.git
 cd dsh-routing-suite
 
 # 2. One-shot install (injector assembly + preset copy + layout self-check + restart prompt)
@@ -41,19 +43,19 @@ Or manually:
 dsh plugin --profile web add .\injector
 # If dsh is not on PATH (npx @deepseek-ai/dsh web): npx '@deepseek-ai/dsh' plugin --profile web add .\injector
 
-# Step 2: install the router presets (one or both; DSH scans one level only,
-# so each preset directory must sit FLAT under .agent-presets)
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-standard'
-Copy-Item -Recurse .\preset\router-standard $target
-
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-spec'
-Copy-Item -Recurse .\preset\router-spec $target
+# Step 2: generate and assemble the router preset bundles
+#   DSH >=0.2 no longer scans ~/.dsh/.agent-presets/. A preset is now declared by
+#   a bundle row (@deepseek-ai/dsh-agent-preset) that feeds the preset registry,
+#   so every preset directory is its own bundle (package.json + dsh.bundle.patch).
+node .\preset\scripts\build-preset-bundle.mjs
+dsh plugin --profile web add .\preset\router-standard
+dsh plugin --profile web add .\preset\router-spec
 
 # Step 3: restart DSH → pick Router Standard / Router Spec in a new session
 ```
 
-> Do NOT copy the `preset` directory as a whole — the extra nesting hides the
-> presets from DSH discovery.
+> The preset `cordis.patch.yml` files are GENERATED from `agent.cordis.yml` +
+> `preset.yml` — edit the source files and regenerate, never the patch.
 
 ## Components
 

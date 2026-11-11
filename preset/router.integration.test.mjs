@@ -31,6 +31,17 @@ function makeHarness(applyFn, config) {
   const listeners = new Map()
   const registeredTools = []
   const agentRef = { current: undefined }
+  // DSH ≥0.2：工具面不再由 system-prompt/assemble 的 waterfall 过滤（0.2 的
+  // 返回体是 PromptPresentation，没有 tools；框架在 waterfall 之后才挂工具
+  // 声明，写进去也会被覆盖）——首轮收窄改由工具准入面表达：tools.restrict。
+  const restrictCalls = []
+  const toolsSvc = {
+    register(tool) { registeredTools.push(tool) },
+    restrict(cfg) { restrictCalls.push(cfg); return () => {} },
+    view() { return { restrictableNames: new Set(TOOLS.map((t) => t.name)), visible: new Map() } },
+    definitions() { return [] },
+    schemas() { return [] },
+  }
   const ctx = {
     on(name, fn) {
       if (!listeners.has(name)) listeners.set(name, [])
@@ -38,13 +49,18 @@ function makeHarness(applyFn, config) {
       return () => {}
     },
     effect(fn) { fn() },
-    get(name) { return name === 'agent' ? agentRef.current : undefined },
-    tools: { register(tool) { registeredTools.push(tool) } },
+    get(name) {
+      if (name === 'agent') return agentRef.current
+      if (name === 'tools') return toolsSvc
+      return undefined
+    },
+    tools: toolsSvc,
+    systemPrompt: { variable() { throw new Error('already registered') } },
     llm: { stream() { throw new Error('llm.stream must not be called in integration tests') } },
   }
   applyFn(ctx, config)
   return {
-    ctx, listeners, registeredTools, agentRef,
+    ctx, listeners, registeredTools, agentRef, toolsSvc, restrictCalls,
     emit(name, ...args) {
       for (const fn of listeners.get(name) ?? []) fn(...args)
     },
@@ -66,7 +82,8 @@ function makeHarness(applyFn, config) {
 
 const SECTIONS = [
   { name: 'harness-identity', text: 'identity', order: -100 },
-  { name: 'persona', text: 'You are a helpful software engineer assistant.', order: 0 },
+  // DSH ≥0.2 的部署人设段名（0.1.x 是 'persona'；0.2 拆成 prefix / suffix 两段）
+  { name: 'deployment:persona-prefix', text: 'You are a helpful software engineer assistant.', order: 0 },
   { name: 'plan-mode', text: 'You are in plan mode.', order: -50 },
   { name: 'tool-guidance', text: 'guidance', order: 100 },
 ]
@@ -77,9 +94,9 @@ const TOOLS = [
 ]
 
 function baseAssembled() {
+  // DSH ≥0.2 的 PromptPresentation：{sections, contexts, variables}——没有 tools。
   return {
     sections: SECTIONS.map((s) => ({ ...s })),
-    tools: TOOLS.map((t) => ({ ...t })),
     contexts: [],
     variables: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
   }
@@ -95,7 +112,11 @@ function makeSession(events = []) {
 
 /** Mirror the loop: claim → assemble → pre-step, then persist decision.messages. */
 async function runFirstStep(h, { message, session }) {
-  const agent = { session, options: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } }
+  const agent = {
+    session,
+    options: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+    ctx: { get: (name) => (name === 'tools' ? h.toolsSvc : undefined) },
+  }
   h.agentRef.current = agent
   h.emit('agent/inbox/claimed', { agent, message })
   const assembled = await h.assemble(baseAssembled(), { agent, scope: agent })
@@ -118,7 +139,12 @@ test('first request: RL persona + phase_begin as the only first-turn tool (v0.9)
   // v0.9 self-routed: RL persona + progressive disclosure gate —— 首轮只有 phase_begin
   assert.match(assembled.sections.find((s) => s.name === 'router-persona').text, /^You are a helpful software engineer assistant\./)
   assert.ok(!assembled.sections.some((s) => s.name === 'router-stage'), 'stage section appears only after phase_begin/promotion')
-  assert.deepEqual(assembled.tools.map((t) => t.name), ['phase_begin'])
+  // DSH ≥0.2：assemble 的返回体不带 tools（框架在 waterfall 之后才挂工具声明）
+  assert.equal(assembled.tools, undefined, '0.2 的 assemble 返回体不带 tools')
+  // 首轮收窄改由工具准入面表达：全局工具整体 deny，只留 scope-local 的 phase_begin
+  assert.ok(h.restrictCalls.length >= 1, '首轮设了工具门')
+  assert.ok(Array.isArray(h.restrictCalls[0].deny) && h.restrictCalls[0].deny.length > 0, '首轮 deny 全局工具')
+  assert.equal(h.restrictCalls[0].allow, undefined, '首轮不是 allow 列表')
   assert.deepEqual(assembled.contexts, [])
   // no injection in the harness (no inbox): the decision stays on the real message
   assert.deepEqual(decision.messages.map((m) => m.id), ['m1'])
@@ -192,8 +218,9 @@ test('standard preset: after the first tool/call the router keeps the full surfa
   assert.ok(assembled.sections.some((s) => s.name === 'router-decl'), 'progressive declaration persists after promotion')
   assert.ok(assembled.sections.some((s) => s.name === 'router-proactivity'), 'pressure guide persists after promotion')
   assert.deepEqual(assembled.contexts, [])
-  assert.ok(assembled.tools.length === TOOLS.length, 'full tool catalog exposed')
-  assert.match(assembled.sections.find((s) => s.name === 'persona').text, /^You are a helpful software engineer assistant\.$/)
+  assert.equal(assembled.tools, undefined, '0.2 的 assemble 返回体不带 tools')
+  assert.equal(h.restrictCalls.length, 0, 'promoted 后不再设工具门（全量工具面）')
+  assert.match(assembled.sections.find((s) => s.name === 'deployment:persona-prefix').text, /^You are a helpful software engineer assistant\.$/)
 })
 
 test('v1.18: catalog default = current tier only; query/all whitebox; help marks unlock stage', async () => {
@@ -350,8 +377,14 @@ test('spec preset (routerMode: standard): RL first turn, then full assembly retu
   const build = userMessage('m7', '从零开发一个马里奥网页游戏')
   const { assembled } = await runFirstStep(h, { message: build, session })
   // RL-interface first turn
-  assert.deepEqual(assembled.sections.map((s) => s.name), ['plan-mode', 'router-persona'])
-  assert.deepEqual(assembled.tools.map((t) => t.name), ['pwsh', 'str_replace_editor'])
+  // DSH ≥0.2：人设段插在数组头部（框架在 waterfall 之前排序、之后不重排）
+  assert.deepEqual(assembled.sections.map((s) => s.name), ['router-persona', 'plan-mode'])
+  assert.equal(assembled.tools, undefined, '0.2 的 assemble 返回体不带 tools')
+  // 首轮工具面 = core（shell + editor）：其余全局工具被 deny
+  assert.ok(h.restrictCalls.length >= 1, '首轮设了工具门')
+  const denied = h.restrictCalls[0].deny ?? []
+  assert.ok(denied.includes('read'), '首轮 deny 掉 read')
+  assert.ok(!denied.includes('pwsh'), '首轮保留 pwsh')
   assert.deepEqual(assembled.contexts, [])
 
   // promoted: the router stops touching the assembly (full sections restored)
@@ -370,7 +403,12 @@ test('spec preset (routerMode: spec): classified persona over the full section l
   const { assembled } = await runFirstStep(h, { message: build, session })
   assert.match(assembled.sections.find((s) => s.name === 'router-persona').text, /hands-on software engineer/)
   assert.equal(assembled.sections.length, SECTIONS.length)
-  assert.deepEqual(assembled.tools.map((t) => t.name), ['pwsh', 'read', 'write', 'edit'])
+  assert.equal(assembled.tools, undefined, '0.2 的 assemble 返回体不带 tools')
+  // spec 档首轮工具面 = legacyCore + shell：其余全局工具被 deny
+  assert.ok(h.restrictCalls.length >= 1, '首轮设了工具门')
+  const denied2 = h.restrictCalls[0].deny ?? []
+  assert.ok(!denied2.includes('read'), 'spec 档首轮保留 read')
+  assert.ok(denied2.includes('grep'), 'spec 档首轮 deny 掉 grep')
 })
 
 // ── resume safety ──────────────────────────────────────────────────────────

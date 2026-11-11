@@ -7,9 +7,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # DSH_HOME 优先：部署环境 homedir 可能与 DSH_HOME 不一致，不能只靠 $HOME
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
-AGENT_PRESETS_DIR="$DSH_HOME/.agent-presets"
 INJECTOR_DIR="$ROOT/injector"
 PRESET_NAMES=("router-standard" "router-spec")
+# 目标 profile：默认取当前运行的 profile（DSH_PROFILE），可用 SCRIPT_PROFILE 覆盖。
+PROFILE_NAME="${SCRIPT_PROFILE:-${DSH_PROFILE:-web}}"
 
 # 输出着色（非终端自动禁用）
 if [ -t 1 ]; then
@@ -78,11 +79,11 @@ if [ -f "$PATCH_FILE" ] && grep -q 'dsh-super-injector' "$PATCH_FILE"; then
   warn 'cordis.patch.yml 已含 dsh-super-injector——跳过装配（防 duplicate loader entry id）'
 elif [ -f "$PKG_DIR/lib/index.js" ]; then
   if command -v dsh >/dev/null 2>&1; then
-    dsh plugin --profile web add "$PKG_DIR" \
+    dsh plugin --profile "$PROFILE_NAME" add "$PKG_DIR" \
       || { err 'dsh plugin add 失败（见上方输出）——可改用手动装配（见下）'; manual_fallback=1; }
   else
     warn 'dsh 不在 PATH——改用 npx @deepseek-ai/dsh 装配'
-    npx '@deepseek-ai/dsh' plugin --profile web add "$PKG_DIR" \
+    npx '@deepseek-ai/dsh' plugin --profile "$PROFILE_NAME" add "$PKG_DIR" \
       || { err 'npx 装配失败（见上方输出）——可改用手动装配（见下）'; manual_fallback=1; }
   fi
   if [ "$manual_fallback" -eq 0 ]; then
@@ -102,40 +103,48 @@ else
   warn '未获得可装配的注入器包（lib 缺失）——请按上方提示处理后再重跑本脚本'
 fi
 
-info '[2/4] 安装 router presets'
-mkdir -p "$AGENT_PRESETS_DIR"
+info '[2/4] 生成 router preset 的 bundle patch'
+# DSH ≥0.2：agent preset 不再是 ~/.dsh/.agent-presets/ 下的目录（该扫描已移除），
+# 预设改为「bundle 声明一行 @deepseek-ai/dsh-agent-preset → 写进 preset 注册表」。
+# 本仓库把每个预设目录做成一个 bundle（package.json + dsh.bundle.patch），
+# patch 由 preset/scripts/build-preset-bundle.mjs 从 agent.cordis.yml + preset.yml 生成。
 for name in "${PRESET_NAMES[@]}"; do
   if [ ! -d "$ROOT/preset/$name" ]; then
     err "仓库缺少预设源码：$ROOT/preset/$name（跳过）"
     continue
   fi
-  target="$AGENT_PRESETS_DIR/$name"
-  if [ -d "$target" ]; then
-    warn "预设已存在：$target（如需覆盖请先手动删除）"
-    continue
+  if command -v node >/dev/null 2>&1; then
+    if node "$ROOT/preset/scripts/build-preset-bundle.mjs" "$name" >/dev/null; then
+      ok "bundle patch 已生成：preset/$name/cordis.patch.yml"
+    else
+      err "生成 bundle patch 失败：preset/$name（跳过该预设）"
+    fi
+  else
+    warn '未找到 node——跳过 preset bundle patch 生成（预设不会被 DSH 发现）'
   fi
-  # 平铺复制：agent-presets 只扫一级子目录，每个预设目录必须直接含 agent.cordis.yml
-  cp -R "$ROOT/preset/$name" "$target"
-  ok "预设已安装：$target"
 done
 
-info '[3/4] 自检预设布局'
+info '[3/4] 装配 router preset bundle'
 failed=0
 for name in "${PRESET_NAMES[@]}"; do
-  check="$AGENT_PRESETS_DIR/$name/agent.cordis.yml"
-  if [ -f "$check" ]; then
-    ok "$name -> agent.cordis.yml 就位"
-  else
-    err "$name 缺少 agent.cordis.yml（$check）——预设不会被 DSH 发现"
+  pkg_dir="$ROOT/preset/$name"
+  if [ ! -f "$pkg_dir/cordis.patch.yml" ]; then
+    err "$name 缺少 cordis.patch.yml（$pkg_dir）——预设不会被 DSH 发现"
     failed=1
+    continue
+  fi
+  if command -v dsh >/dev/null 2>&1; then
+    dsh plugin --profile "$PROFILE_NAME" add "$pkg_dir" || { err "装配预设失败：$name"; failed=1; }
+  else
+    npx '@deepseek-ai/dsh' plugin --profile "$PROFILE_NAME" add "$pkg_dir" || { err "装配预设失败：$name"; failed=1; }
   fi
 done
 if [ "$failed" -ne 0 ]; then
-  err '预设布局自检失败——请勿复制 preset 整目录（会多套一层），每个预设目录需直接含 agent.cordis.yml'
+  err '预设装配有失败项——请检查上面的输出'
 fi
 
 info '[4/4] 完成'
-echo '1. 重启 DSH（web 服务）'
+echo "1. 重启 DSH（profile: $PROFILE_NAME）"
 echo '2. GUI 新建会话 → 选择 Router Standard / Router Spec (experimental)'
 echo '3. 发任务：生成任务自动 react，维护任务自动 spec，模糊任务进 weak 内路由'
 echo '4. AI 自优化工具：dev_router_status / dev_router_mode / dev_mode_subagent'

@@ -4,7 +4,7 @@
  * 时序（用户定稿）：
  *   T0 首轮 = 纯 RL 句（46 字符）+ phase_begin（唯一确认工具，native；稳定 we）
  *   T1 模型调 phase_begin（确认开启）→ Bootstrap 消息（声明+主动性+阶段0指引）
- *      + 解锁阶段 0 + 切换 native 呈现（presentAs native；v1.15 定案，PTC/run_code 已退役）
+ *      + 解锁阶段 0（DSH ≥0.2：native 呈现由宿主的 native 工具执行器决定，无需再切）
  *   T2 闯关：模型完成阶段 → phase_advance → 解锁下一档 + 阶段提示（一次）
  *
  * 要点：
@@ -15,7 +15,7 @@
  */
 
 import {
-  bandFor, sessionMode, extractText, isComplexTask, sessionEvents
+  bandFor, sessionMode, extractText, isComplexTask, sessionEvents, narrowToolSurface, isPersonaPrefix
 } from './router-core-v34.mjs'
 import { join, dirname } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
@@ -183,7 +183,7 @@ export function muteAwareList(names, muted) {
 /** 会话是否为新会话（DSH request/header reason=initial）——即使 session id 复用了旧阶段记录，也自动从 0 开始。 */
 export function sessionFresh(agent) {
   try {
-    for (const e of agent?.session?.events || []) {
+    for (const e of sessionEvents(agent?.session) || []) {
       if (e.type === 'request/header' && e.data?.reason === 'initial') return true
     }
   } catch { /* 无法判定时按旧会话处理 */ }
@@ -194,7 +194,7 @@ export function sessionFresh(agent) {
  *  检测会话用户消息中的记忆禁用意图；命中后阶段指引不再提 recall/verify/engram。 */
 export function memoryMuted(session) {
   try {
-    const events = session?.events || []
+    const events = sessionEvents(session)
     const re = /不用记忆|勿用记忆|禁用记忆|记忆系统.*(不用|不要|禁用)|不要用记忆|no memory|without memory/i
     for (const e of events) {
       if (e.type !== 'user/message') continue
@@ -207,7 +207,7 @@ export function memoryMuted(session) {
 /** 会话任务回显（v1.19.1 引导工程）：取第一条真实用户消息，让模型每轮都看清"我在为哪件事工作"。 */
 export function firstUserTask(session) {
   try {
-    for (const e of session?.events || []) {
+    for (const e of sessionEvents(session) || []) {
       if (e.type !== 'user/message') continue
       const src = e.data?.source ?? e.data?.message?.source
       if (src?.kind !== 'user') continue
@@ -317,19 +317,29 @@ function registryFullIndex(toolsSvc, scope) {
     layersList.push(...chain)
     if (ls?.global) layersList.push(ls.global)
     const findDef = (name) => {
+      // DSH ≥0.2：层里的表项是注册记录 {definition, when}，不是定义本身——
+      // 取定义要拆一层（0.1.x 的表项直接就是定义）。
+      const unwrap = (value) => {
+        if (value === undefined || value === null) return undefined
+        if (typeof value === 'object' && value.definition !== undefined) return value.definition
+        return value
+      }
       for (const layer of layersList) {
         const lt = layer?.tools
-        let def = typeof lt?.get === 'function' ? lt.get(name) : undefined
+        let def = unwrap(typeof lt?.get === 'function' ? lt.get(name) : undefined)
         if (!def && lt && typeof lt.entries === 'function') {
-          for (const [nn, dd] of lt.entries()) if (nn === name) { def = dd; break }
+          for (const [nn, dd] of lt.entries()) if (nn === name) { def = unwrap(dd); break }
         }
         if (def) return def
       }
       /* host 兜底（v1.13）：host 注入核心工具（旧 run_code 系）不在层链——从 registry 视图/原始 schemas 反查 */
       try {
         if (typeof toolsSvc?.view === 'function') {
-          const d = toolsSvc.view(scope)?.tools?.get?.(name)
-          if (d) return d
+          const view = toolsSvc.view(scope)
+          // 0.2 的 view 返回 {visible, registrations, knownNames, restrictableNames}；
+          // visible 是 name → ToolDefinition 的表。
+          const d = view?.visible?.get?.(name) ?? view?.tools?.get?.(name)
+          if (d) return unwrap(d)
         }
         if (typeof toolsSvc?.schemas === 'function') {
           for (const s of toolsSvc.schemas(scope)) {
@@ -560,7 +570,7 @@ function saveStageState() {
  *  下一步重复计入并再次跳级（v0.3.0 缺陷）。事件下标是身份，不是时钟。 */
 function markStageConsumed(st, session) {
   st.stageAtTime = Date.now()
-  const events = session?.events
+  const events = sessionEvents(session)
   if (Array.isArray(events)) st.consumed = events.length
 }
 
@@ -592,6 +602,35 @@ function applyStageRestrict(agent, stage) {
   } catch (e) { console.error('[router-bootstrap] applyStageRestrict failed:', e); /* scope-local names in allow: skip restrict, keep full catalog */ }
 }
 
+/**
+ * 首轮工具门 —— 0.1.x「首轮工具面只留 phase_begin」在 DSH ≥0.2 的等价物。
+ *
+ * 0.1.x 靠 system-prompt/assemble 把 assembled.tools 过滤成只剩 phase_begin；
+ * 0.2 起 assemble 的返回体是 PromptPresentation {sections, contexts, variables}，
+ * **不再带 tools**（工具声明归各自提供者，框架在 waterfall 之后才挂上去），
+ * 既读不到也写不进。0.2 的准入面由工具注册表表达：
+ *
+ *   - 对该 agent 的**全局**工具整体 deny → 全局工具一个不露；
+ *   - 本预设 scope 内注册的 phase_begin 是 scope-local 注册，restrict 不影响它
+ *     （"scoped registrations remain visible"）→ 模型仍能看见并调用 phase_begin。
+ *
+ * phase_begin 被调用后走 applyStageRestrict：先释放这道门（restrict 取交集，
+ * 叠加会让阶段放行失效），再按阶段放行 allow 列表。
+ */
+function installStageGate(agent, stage) {
+  try {
+    if (stage > 0) return
+    const sid = agent?.session?.id
+    const toolsSvc = agent?.ctx?.get?.('tools')
+    if (!toolsSvc || typeof toolsSvc.restrict !== 'function') return
+    const prev = sid ? sharedLift.get(sid) : undefined
+    if (prev) { try { prev() } catch { /* ignore */ } ; if (sid) sharedLift.delete(sid) }
+    // allow 空 = 全局工具一个不露；scope-local 的 phase_begin 仍然可见。
+    const disposer = narrowToolSurface(toolsSvc, agent, [])
+    if (sid && disposer) sharedLift.set(sid, disposer)
+  } catch (e) { console.error('[router-bootstrap] installStageGate failed:', e); /* 门失败 → 退化为全量工具面 */ }
+}
+
 export function apply(ctx, config) {
   try { mkdirSync(join(process.env.DSH_HOME || homedir(), 'router-standard'), { recursive: true }); writeFileSync(join(process.env.DSH_HOME || homedir(), 'router-standard', 'last-mount.txt'), 'new-gen v0.8 ' + new Date().toISOString(), 'utf8') } catch { /* marker */ }
   // 运行环境修整：① node 进 PATH（harness 的 node 在自定义运行时目录，不在系统 PATH——v1.5 实测
@@ -613,10 +652,46 @@ export function apply(ctx, config) {
         JSON.stringify({ at: new Date().toISOString(), win32: process.platform === 'win32', nodeDir, gitCandidates: cands, nodeOnPath: fore.some((e) => existsSync(join(e, 'node.exe'))) }, null, 2), 'utf8')
     } catch { /* 诊断失败不阻塞 */ }
   } catch { /* PATH 修整失败不阻塞 */ }
+  /**
+   * DSH ≥0.2 的预设「活重载」：预设不再是 ~/.dsh/.agent-presets/ 下的目录，
+   * 而是 bundle 声明的一行 @deepseek-ai/dsh-agent-preset —— 0.1.x 那套
+   * 「改 agent.cordis.yml 里的 ?v=N 再 recompose」的缓存击穿手法不再成立
+   * （0.2 的预设行按包子路径解析，行名带 ?v 会破坏 exports 解析）。
+   * 新的做法：清掉该预设引导器的模块缓存条目，再 recompose 重挂新一代。
+   */
+  function purgePresetModules(presetId) {
+    try {
+      const loadCache = ctx.get('loader')?.internal?.loadCache
+      if (!loadCache || typeof loadCache.delete !== 'function') return []
+      const purged = []
+      for (const u of [...loadCache.keys()]) {
+        const s = String(u)
+        if (!s.includes(presetId)) continue
+        Map.prototype.delete.call(loadCache, u)
+        purged.push(s)
+      }
+      return purged
+    } catch { return [] }
+  }
+
   const agents = new Map()
   const firstUserText = new Map()
   const sessionModels = new Map()
   const shimmedSessions = new Set()
+
+  // DSH ≥0.2：人设里的 {{cwd}} 需要一个已注册的提示变量。0.2 的 agent-loop 只
+  // 注册 provider / model 两个变量，未注册的引用在渲染时**抛错**（整段 system
+  // 渲染失败）——所以预设自己补一个 cwd（宿主若已注册同名变量，insert 抛重复，
+  // 捕获后跳过即可）。
+  try {
+    ctx.systemPrompt.variable('cwd', (context) => {
+      try {
+        return context?.agent?.session?.header?.cwd ?? process.cwd()
+      } catch {
+        return process.cwd()
+      }
+    })
+  } catch { /* 宿主已注册 cwd（或该版本没有 variable()）→ 用宿主的那份 */ }
 
   ctx.on('agent/inbox/claimed', ({ agent, message }) => {
     if (message?.source?.kind !== 'user') return
@@ -641,22 +716,38 @@ export function apply(ctx, config) {
 
     const promoted = sessionEvents(session).some((event) => event.type === 'tool/call')
     const planSection = (assembled.sections || []).find((s) => /plan/i.test(s.name))
+    // DSH ≥0.2：AssembledSection 不再带 order，框架在 waterfall 之前排序、
+    // 之后不重排 —— 人设段要排在最前只能插到数组头部。
+    const routerPersonaSection = { name: 'router-persona', text: RL_PERSONA }
     const baseSections = planSection
-      ? [planSection, { name: 'router-persona', text: RL_PERSONA, order: 0 }]
-      : [{ name: 'router-persona', text: RL_PERSONA, order: 0 }]
+      ? [routerPersonaSection, planSection]
+      : [routerPersonaSection]
 
     if (!promoted) {
       // 首轮：无 restrict + 工具面只留 phase_begin（纯 RL 条件 = 稳定 we）
-      return { ...assembled, sections: baseSections, contexts: [], tools: assembled.tools.filter((tool) => tool.name === 'phase_begin') }
+      //
+      // DSH ≥0.2：system-prompt/assemble 的返回体是 PromptPresentation
+      // {sections, contexts, variables} —— **不再带 tools**（工具声明由各自的
+      // 提供者拥有，框架在 waterfall 之后才把工具挂上去）。所以这里既不能读
+      // assembled.tools，也不能往返回值里塞 tools（塞了会被框架覆盖）。
+      //
+      // 首轮「只露 phase_begin」改由 0.2 的工具准入表达：phase_begin 的注册带
+      // when 条件（未确认前不参与本步），其余全局工具由 tools.restrict 挡住。
+      // restrict 的作用域是 agent（agent.ctx.tools.restrict），见 installStageGate。
+      try { installStageGate(agent, 0) } catch { /* 首轮门失败不阻断（退化为全量工具面） */ }
+      return { ...assembled, sections: baseSections, contexts: [] }
     }
 
     // promoted：官方 sections 回流（persona 保持 RL 句）+ 引导带宽控 + 阶段声明 + 常驻段
     const stage = ensureStage()[session.id]?.stage ?? 0
     const toolsSvc = agent?.ctx?.get?.('tools')
     const fullNames = knownToolNames(toolsSvc, agent)
-    const sections = filterToolGuidance((assembled.sections || []).map((s) =>
-      /persona/i.test(s.name) ? { ...s, text: RL_PERSONA } : s
-    ), stage, fullNames)
+    // DSH ≥0.2：部署人设分 prefix / suffix 两段 —— 只把 prefix 换成 RL 句，
+    // suffix 丢掉（否则 RL 句会被注入两遍）。
+    const sections = filterToolGuidance((assembled.sections || [])
+      .filter((s) => !/persona-suffix/i.test(s.name))
+      .map((s) => (isPersonaPrefix(s.name) ? { ...s, text: RL_PERSONA } : s))
+    , stage, fullNames)
     // v1.18.1 口径统一：先安装 meta shim，再基于同一注册面渲染 stageText（与 dev_router_status 同源）
     if (!shimmedSessions.has(session.id)) {
       try { installMetaShim(agent, { installStage: true, stage }); shimmedSessions.add(session.id) } catch { /* ignore */ }
@@ -665,7 +756,7 @@ export function apply(ctx, config) {
     // 声明与主动性常驻（人设常驻：不经压缩丢失；bootstrap 消息可能被 compaction 剪掉）
     sections.push({ name: 'router-decl', order: 2, text: PROGRESSIVE_DECL })
     sections.push({ name: 'router-proactivity', order: 3, text: PRESSURE_GUIDE.replace(/^\n+/, '') })
-    const available = new Set(assembled.tools.map((tool) => tool.name))
+    const available = new Set((assembled.tools ?? []).map((tool) => tool.name))
     if (available.has('run_code')) {
       const staged = buildStagedSdk(sections, stage)
       if (staged) {
@@ -746,7 +837,8 @@ export function apply(ctx, config) {
         try { installMetaShim(currentAgent(), { installStage: false, stage: 0 }) } catch { /* ignore */ }
         try {
           const toolsSvc = currentAgent()?.ctx?.get?.('tools')
-          if (toolsSvc && typeof toolsSvc.presentAs === 'function') toolsSvc.presentAs('native')
+          // DSH ≥0.2：toolsSvc.presentAs 已移除（呈现改由宿主挂的 native / PTC
+          // 工具执行器决定，宿主行 tool-executor-native 已经是 native）——这里无需再切。
         } catch { /* already declared */ }
         const toolsSvc = currentAgent()?.ctx?.get?.('tools')
         const runtimeList = muteAwareList(runtimeCallable(toolsSvc, currentAgent()), memoryMuted(session))
@@ -779,7 +871,8 @@ export function apply(ctx, config) {
       try { installMetaShim(currentAgent(), { installStage: false, stage: 0 }) } catch { /* ignore */ }
       try {
         const toolsSvc = currentAgent()?.ctx?.get('tools')
-        if (toolsSvc && typeof toolsSvc.presentAs === 'function') toolsSvc.presentAs('native') // v1.15 定案：wire = restrict 过滤后的可见工具（注入面+调用面同时阶段化，SDK 段归零——39K 注意力税消失），且所有工具直接可调（无折叠）。both 的双注入态（wire 全量 + SDK 全量）已废弃
+        // DSH ≥0.2：presentAs 已移除——wire 仍是 restrict 过滤后的可见工具
+        // （注入面 + 调用面同时阶段化，SDK 段归零），且所有工具直接可调（无折叠）。
       } catch { /* already declared */ }
       const toolsSvc = currentAgent()?.ctx?.get?.('tools')
       const runtimeList = muteAwareList(runtimeCallable(toolsSvc, currentAgent()), memoryMuted(session))
@@ -947,7 +1040,7 @@ export function apply(ctx, config) {
     const sid = agent.session?.id || ''
     const make = (def) => {
       try {
-        try { toolsSvc?.layers?.scoped?.get?.(agent)?.tools?.data?.delete?.(def.name) } catch { /* own-layer 可能在别处 */ }
+        try { toolsSvc?.layers?.peek?.(agent)?.tools?.data?.delete?.(def.name) } catch { /* own-layer 可能在别处 */ }
         toolsSvc.register({
           name: def.name,
           description: def.description,
@@ -1092,18 +1185,10 @@ export function apply(ctx, config) {
         const targetSid2 = shimArgs?.targetSessionId || target2.session?.id || sid
         const before2 = ap2.composedPreset(target2.ctx) ?? 'unknown'
         if (before2 === 'unknown') return 'ERROR: 未加入预设'
-        const ymlFile2 = join(process.env.DSH_HOME || homedir(), '.agent-presets', before2, 'agent.cordis.yml')
-        let yml2 = ''
-        try { yml2 = readFileSync(ymlFile2, 'utf8') } catch (e) { return 'ERROR: 读取失败 ' + String(e) }
-        const refRe2 = /(name: \.\/[A-Za-z0-9._-]+\.mjs)(\?v=\d+)?/g
-        const b2 = []
-        yml2 = yml2.replace(refRe2, (whole, base, query) => {
-          const cur = query ? Number(query.slice(3)) : 0
-          b2.push(base.split('/').pop() + '->?v=' + (cur + 1))
-          return base + '?v=' + (cur + 1)
-        })
-        if (!b2.length) return 'ERROR: 无相对 .mjs 引用'
-        writeFileSync(ymlFile2, yml2, 'utf8')
+        // DSH ≥0.2：清模块缓存 + recompose（0.1.x 的 ?v=N 手法已失效）
+        const purged2 = purgePresetModules(before2)
+        const b2 = purged2.map((u) => u.split('/').pop())
+        if (!b2.length) return 'ERROR: 未找到该预设的模块缓存（可能已在最新代）'
         const stage2 = ensureStage()[targetSid2]?.stage ?? 0
         await ap2.recompose(target2.ctx, before2)
         applyStageRestrict(target2, stage2)
@@ -1181,7 +1266,7 @@ export function apply(ctx, config) {
         markStageConsumed(st, agent?.session)
         saveStageState()
         applyStageRestrict(agent, 0)
-        const ownT = toolsSvc?.layers?.scoped?.get?.(agent)?.tools
+        const ownT = toolsSvc?.layers?.peek?.(agent)?.tools
         for (const nm of STAGE_HOST) { try { ownT?.data?.delete?.(nm) } catch { /* ignore */ } }
         installMetaShim(agent, { installStage: false, stage: 0 })
         return 'reset to phase 0: ' + STAGES[0].name + '（stage tools cleared; meta/goal retained）——现在用 todo_write 触发自动推进'
@@ -1213,7 +1298,7 @@ export function apply(ctx, config) {
           }
           if (def) {
             try {
-              try { toolsSvc?.layers?.scoped?.get?.(agent)?.tools?.data?.delete?.(name) } catch { /* ignore */ }
+              try { toolsSvc?.layers?.peek?.(agent)?.tools?.data?.delete?.(name) } catch { /* ignore */ }
               toolsSvc.register(def); n += 1; seen.add(name)
             } catch { /* duplicate/无效 */ }
           }
@@ -1241,22 +1326,10 @@ export function apply(ctx, config) {
       if (!ap || !agent) return 'ERROR: agentPresets/agent 不可用 (target=' + label + ')'
       const before = ap.composedPreset(agent.ctx) ?? 'unknown'
       if (before === 'unknown') return 'ERROR: 当前 agent 未加入预设'
-      const home = process.env.DSH_HOME || homedir()
-      const presetDir = join(home, '.agent-presets', before)
-      const ymlFile = join(presetDir, 'agent.cordis.yml')
-      let yml = ''
-      try { yml = readFileSync(ymlFile, 'utf8') } catch (e) { return 'ERROR: 读取失败 ' + ymlFile + ' ' + String(e) }
-      const refRe = /(name: \.\/[A-Za-z0-9._-]+\.mjs)(\?v=\d+)?/g
-      let bumped = []
-      let matched = false
-      yml = yml.replace(refRe, (whole, base, query) => {
-        matched = true
-        const cur = query ? Number(query.slice(3)) : 0
-        bumped.push(base.split('/').pop() + ' -> ?v=' + (cur + 1))
-        return base + '?v=' + (cur + 1)
-      })
-      if (!matched) return 'ERROR: 无相对 .mjs 引用'
-      writeFileSync(ymlFile, yml, 'utf8')
+      // DSH ≥0.2：预设来自 bundle 行，清模块缓存 + recompose 即换新代
+      const purged = purgePresetModules(before)
+      const bumped = purged.map((u) => u.split('/').pop())
+      if (!bumped.length) return 'ERROR: 未找到该预设的模块缓存（可能已在最新代）'
       const targetSid = (args && args.targetSessionId) || currentSession()?.id || agent.session?.id || ''
       const stage = ensureStage()[targetSid]?.stage ?? 0
       const preset = await ap.recompose(agent.ctx, before)

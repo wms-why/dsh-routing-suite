@@ -56,45 +56,55 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  const run = async (spec) => {
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), spec.timeoutMs)
+    let outcome
+    let outReader
+    let errReader
+    let spawnError = ''
+    try {
+      const handle = ctx.subprocess.spawn({
+        argv: [bashPath, '-lc', spec.command],
+        cwd: spec.workdir,
+        stdio: {
+          stdin: 'ignore',
+          stdout: { maxBytes: spec.stdoutMaxBytes, spill: { maxBytes: spec.stdoutMaxBytes * 2 } },
+          stderr: { maxBytes: spec.stdoutMaxBytes, spill: { maxBytes: spec.stdoutMaxBytes * 2 } },
+        },
+        graceMs: 3000,
+        signal: spec.signal || ac.signal,
+      })
+      outcome = await handle.done
+      outReader = handle.collected?.stdout
+      errReader = handle.collected?.stderr
+    } catch (e) {
+      spawnError = (e && e.message) || String(e)
+    } finally { clearTimeout(timer) }
+    const timedOut = ac.signal.aborted
+    return {
+      exitCode: Number(outcome?.exitCode ?? outcome?.code ?? -1),
+      signal: outcome?.signal ?? null,
+      timedOut,
+      aborted: spawnError !== '' ? true : ac.signal.aborted && !timedOut,
+      timeoutMs: spec.timeoutMs,
+      stdout: finalOutput(outReader),
+      stderr: finalOutput(errReader),
+      ...spawnError ? { spawnError } : {},
+    }
+  }
+
   const shell = {
     // 不声明 sandboxMode：Git Bash（MSYS）在受限令牌内无法启动——限制由指引说明，不做策略伪装
     resolve(request) { return mkSpec(request) },
-    async run(spec) {
-      const ac = new AbortController()
-      const timer = setTimeout(() => ac.abort(), spec.timeoutMs)
-      let outcome
-      let outReader
-      let errReader
-      let spawnError = ''
-      try {
-        const handle = ctx.subprocess.spawn({
-          argv: [bashPath, '-lc', spec.command],
-          cwd: spec.workdir,
-          stdio: {
-            stdin: 'ignore',
-            stdout: { maxBytes: spec.stdoutMaxBytes, spill: { maxBytes: spec.stdoutMaxBytes * 2 } },
-            stderr: { maxBytes: spec.stdoutMaxBytes, spill: { maxBytes: spec.stdoutMaxBytes * 2 } },
-          },
-          graceMs: 3000,
-          signal: spec.signal || ac.signal,
-        })
-        outcome = await handle.done
-        outReader = handle.collected?.stdout
-        errReader = handle.collected?.stderr
-      } catch (e) {
-        spawnError = (e && e.message) || String(e)
-      } finally { clearTimeout(timer) }
-      const timedOut = ac.signal.aborted
-      return {
-        exitCode: Number(outcome?.exitCode ?? outcome?.code ?? -1),
-        signal: outcome?.signal ?? null,
-        timedOut,
-        aborted: spawnError !== '' ? true : ac.signal.aborted && !timedOut,
-        timeoutMs: spec.timeoutMs,
-        stdout: finalOutput(outReader),
-        stderr: finalOutput(errReader),
-        ...spawnError ? { spawnError } : {},
-      }
+    run,
+    /**
+     * DSH ≥0.2 的 shell seam：execute(spec) 返回一个「带 result() 的句柄」
+     * （0.2 的 tool-bash 走 `await (await ctx.shell.execute(spec)).result()`；
+     * 0.1.x 的 run(spec) 直接返回结果——两个都留着，按宿主版本自适应）。
+     */
+    async execute(spec) {
+      return { result: async () => await run(spec) }
     },
     start(spec) {
       const handle = ctx.subprocess.spawn({

@@ -28,7 +28,7 @@ import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
-import { join, relative, dirname, resolve } from 'node:path'
+import { join, relative, dirname, resolve, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { pathToFileURL, fileURLToPath } from 'node:url'
@@ -567,6 +567,38 @@ function withOpLock<T>(fn: () => Promise<T> | T): Promise<T> {
   return run
 }
 
+/**
+ * 停掉一个 loader entry 的运行实例（loader 1.0.x → 1.1.0 兼容层）。
+ *
+ * loader ≤1.0.2 的 Entry 暴露 `entry._dispose()`；1.1.0 删掉了这个私有方法，
+ * 停实例的唯一公开途径是 fiber 自己的 `dispose()`（cordis 4.x：fiber.dispose
+ * 是 async，结束后 `fiber.uid === null`，loader 的 Entry.update 见到无 fiber
+ * 就会重新 import + 启动）。这里优先用新契约，旧契约保留为回退。
+ */
+async function disposeEntryFiber(entry: any): Promise<void> {
+  if (entry && typeof entry._dispose === 'function') {
+    await entry._dispose()
+    return
+  }
+  const fiber = entry?.fiber
+  if (fiber && typeof fiber.dispose === 'function') {
+    await fiber.dispose()
+  }
+}
+
+/**
+ * 读一个 fiber 当前生效的配置（cordis 4.0.x → 4.1.x 兼容层）。
+ *
+ * 4.0.x 的 Fiber 有私有 `_config`；4.1.x 换成公开的 `rawConfig`（注册时传入
+ * 的原始配置，与 `_config` 同义）和 `effectiveConfig`（schema 填充后的值）。
+ * 注入器的重载路径要拿“旧配置 + entry 配置”浅合并，故取 rawConfig。
+ */
+function rawConfigOf(fiber: any): unknown {
+  if (!fiber) return undefined
+  if (fiber.rawConfig !== undefined) return fiber.rawConfig
+  return fiber._config
+}
+
 export function apply(ctx: AppContext, config: Config): void {
   const logger = ctx.logger
   // ⚠️ DSH_HOME 优先（实测踩坑）：部署的 web 进程 homedir 可能与 DSH_HOME 指向
@@ -574,7 +606,14 @@ export function apply(ctx: AppContext, config: Config): void {
   // junction 建到错误 profile、loader 找不到包。DSH_HOME 环境变量才是权威。
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
   const registryFile = config.registryFile || join(dshHome, 'super-injector', 'registry.json')
-  const profileNodeModules = config.profileNodeModules || join(dshHome, 'profiles', 'web', 'node_modules')
+  // profile 的 node_modules：优先用“当前正在跑的 profile”（ctx.get('profileContext').dir
+  // 由 host 提供，desktop/web 等每个 profile 各自一份）；拿不到时回退 DSH_PROFILE
+  // 环境变量，最后才是历史上的 'web'。写死 'web' 会把 junction 建到没在跑的
+  // profile 上——loader 找不到包，注入必失败。
+  const profileDir = (ctx.get('profileContext') as { dir?: string } | undefined)?.dir
+  const fallbackProfileName = process.env.DSH_PROFILE || 'web'
+  const profileNodeModules = config.profileNodeModules
+    || (profileDir ? join(profileDir, 'node_modules') : join(dshHome, 'profiles', fallbackProfileName, 'node_modules'))
   // 热重载的 config 合并路径可能缺 schema 新字段（旧 fiber _config + patch 旧值），
   // 防御性兜底（schema 默认值只在 loader 装配时保证）。
   const intervalMs = config.intervalMs ?? 1500
@@ -1060,15 +1099,15 @@ export function apply(ctx: AppContext, config: Config): void {
             // 是 reboot 上下文的必要适配，且需 _disposing 豁免（entry._dispose
             // 官方计数）与 disabled 兜底清理。
             const entry = selfEntry as any
-            if (!entry || typeof entry._dispose !== 'function') {
-              throw new Error('selfEntry 无官方 _dispose（loader 契约缺失）')
+            if (!entry) {
+              throw new Error('selfEntry 缺失（loader 契约缺失）')
             }
             const rebootCtx = ctx.root as any
             const previousPlugin = entry.fiber?.runtime?.callback ?? null
             const fresh = rebootCtx.loader.unwrapExports(
               await entry.parent.tree.import(entry.options.name, () => []),
             )
-            await entry._dispose()
+            await disposeEntryFiber(entry)
             const startWith = async (plugin: any): Promise<void> => {
               const fiber = rebootCtx.registry.plugin(plugin, entry.options.config ?? {}, entry.getOuterStack)
               fiber.entry = entry
@@ -1265,7 +1304,7 @@ export function apply(ctx: AppContext, config: Config): void {
     const failures: string[] = []
     let rebuilt = 0
     try {
-      const config = currentConfigOf(fibers[0]?._config)
+      const config = currentConfigOf(rawConfigOf(fibers[0]))
       // ⚠️ 竞态修复：cordis 的 fiber.dispose() 是异步清理（_unload await disposables，
       // 含 context/tools 注册注销）——必须先 await 旧 fiber 完全 dispose，
       // 再建新 fiber，否则新 fiber apply 时旧注册残留 → duplicate（此前热
@@ -1309,7 +1348,7 @@ export function apply(ctx: AppContext, config: Config): void {
       try {
         ctx.registry.delete(fresh)
         for (const oldFiber of fibers) {
-          const fiber = oldFiber.parent.registry.plugin(oldPlugin, currentConfigOf(oldFiber._config), () => [])
+          const fiber = oldFiber.parent.registry.plugin(oldPlugin, currentConfigOf(rawConfigOf(oldFiber)), () => [])
           fiber.entry = oldFiber.entry
           if (fiber.entry) fiber.entry.fiber = fiber
         }
@@ -1683,8 +1722,12 @@ export function apply(ctx: AppContext, config: Config): void {
       const st = entry.fiber ? FIBER_NAMES[entry.fiber.state] : 'no-fiber'
       if (st === 'active') continue
       try {
-        const p = entry.parent.remove(entry.id, true)
-        if (p && typeof p.then === 'function') p.catch(() => { /* 忽略 */ })
+        // loader ≥1.1.0：EntryGroup.remove() 同步返回 void；1.0.2 及更早返回 Promise<void>。
+        // 两种返回形态都兼容，避免 await 一个 void（TS1345/TS2339）。
+        const p: unknown = entry.parent.remove(entry.id, true)
+        if (p && typeof (p as { then?: unknown }).then === 'function') {
+          void (p as Promise<void>).catch(() => { /* 忽略 */ })
+        }
         logger.info('[super-injector] 清理残留 entry %s（%s）', entry.id, st)
       } catch { /* 清理失败不阻塞 */ }
     }
@@ -2671,7 +2714,7 @@ export function apply(ctx: AppContext, config: Config): void {
       },
       profile: {
         type: 'string',
-        description: '目标 profile 名（缺省 web）',
+        description: '目标 profile 名（缺省=当前运行的 profile）',
       },
     },
     output: {
@@ -2681,7 +2724,8 @@ export function apply(ctx: AppContext, config: Config): void {
     async execute(args) {
       return withOpLock(async () => {
       const dir = String(args.dir)
-      const profileName = args.profile ? String(args.profile) : 'web'
+      // 缺省=当前运行的 profile（写死 'web' 会装到没在跑的 profile 上）
+      const profileName = args.profile ? String(args.profile) : (profileDir ? basename(profileDir) : fallbackProfileName)
       try {
         const pkgPath = join(dir, 'package.json')
         if (!existsSync(pkgPath)) return 'ERROR: 目录无 package.json: ' + dir

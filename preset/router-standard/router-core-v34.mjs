@@ -200,11 +200,58 @@ export function clamp01(v) {
  * everything else — the plan-mode section above all, which is toggled per
  * plan state and carries the plan-boundary instructions.
  */
+/**
+ * DSH ≥0.2 的工具面收窄 —— 0.1.x 那套「在 system-prompt/assemble 里过滤
+ * assembled.tools」已经失效：0.2 的 assemble 返回体是 PromptPresentation
+ * {sections, contexts, variables}（**没有 tools**），而且框架在 waterfall
+ * 之后才把工具声明挂上去，返回值里写 tools 也会被覆盖。
+ *
+ * 0.2 的表达面是工具注册表的准入面：
+ *   - restrict({ deny }) 对该 agent 的**全局**工具整体设门；
+ *   - 本 scope 自己注册的工具（scope-local，如 phase_begin）不受 restrict 影响，
+ *     仍然可见 —— 这正是「首轮只露 phase_begin」要的形状；
+ *   - 返回的 disposer 用于释放这道门（restrict 取交集，叠加会让阶段放行失效）。
+ *
+ * @param toolsSvc - 该 agent 的 tools 服务（agent.ctx.get('tools')）
+ * @param agent - 目标 agent（restrict 的作用域由调用点决定）
+ * @param allowNames - 允许留在全局可见面的工具名（其余全局工具被 deny）
+ * @returns 释放这道门的 disposer；无法设门时返回 undefined
+ */
+export function narrowToolSurface(toolsSvc, agent, allowNames) {
+  try {
+    if (!toolsSvc || typeof toolsSvc.restrict !== 'function') return undefined
+    let known = null
+    try { if (typeof toolsSvc.view === 'function') known = new Set(toolsSvc.view(agent).restrictableNames) } catch { /* ignore */ }
+    if (known === null || known.size === 0) return undefined
+    const allow = new Set(allowNames || [])
+    const deny = [...known].filter((name) => !allow.has(name))
+    if (deny.length === 0) return undefined
+    return toolsSvc.restrict({ deny })
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 部署人设段的判定 —— DSH ≥0.2 的段名是 'deployment:persona-prefix'
+ * （0.1.x 是 'persona'；0.2 另有 'deployment:persona-suffix'，那半段不顶替）。
+ */
+export function isPersonaPrefix(name) {
+  return name === 'persona' || /persona-prefix/i.test(String(name || ''))
+}
+
 export function applyPersona(sections, personaText) {
+  // DSH ≥0.2：部署人设拆成两段 —— 'deployment:persona-prefix' 与
+  // 'deployment:persona-suffix'（0.1.x 只有一段 'deployment:persona'）。
+  // 路由人设整体顶替部署人设：prefix 换成 router 人设，suffix 丢弃
+  // （留着就会把 RL 句注入两遍）。
+  //
+  // 顺序：0.2 的 AssembledSection 不再带 order，且框架在 waterfall 之前
+  // 排好序、之后不再重排 —— 人设段要「排在最前」只能插到数组头部。
   const rest = (sections || []).filter(
-    (section) => section.name !== 'persona' && !/persona/i.test(section.name),
+    (section) => !isPersonaPrefix(section.name) && !/persona-suffix/i.test(section.name),
   )
-  return [...rest, { name: 'router-persona', text: personaText, order: 0 }]
+  return [{ name: 'router-persona', text: personaText }, ...rest]
 }
 
 /** Parse a user/agent-supplied mode token: number 0-100, 0.0-1.0, or a band name. */
