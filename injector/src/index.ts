@@ -945,7 +945,16 @@ export function apply(ctx: AppContext, config: Config): void {
         const candidates: string[] = []
         if (name) {
           const parts = name.startsWith('@') ? name.split('/') : [name]
-          candidates.push(join(profileNodeModules, ...parts, 'lib', 'index.js'))
+          const pkgDir = join(profileNodeModules, ...parts)
+          candidates.push(join(pkgDir, 'lib', 'index.js'))
+          // 布局不是 lib/index.js 的包（main 指向别的文件）——从 package.json 的
+          // main 解析，别只认一种布局（实测：mode-router 的 main 是 ./lib/index.js，
+          // 但自定义包完全可能是 ./index.js）。
+          try {
+            const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'))
+            const main = typeof manifest.main === 'string' ? manifest.main : undefined
+            if (main) candidates.push(join(pkgDir, main.replace(/^\.\//, '')))
+          } catch { /* 读不到 manifest 就只用 lib/index.js 兜底 */ }
         }
         if (urlMatch) candidates.push(join(urlMatch, 'lib', 'index.js'))
         for (const lib of candidates) {
